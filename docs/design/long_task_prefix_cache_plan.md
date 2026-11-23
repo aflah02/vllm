@@ -22,15 +22,32 @@ For each incoming input, evaluate all ten policies and return one label per poli
 
 Use a queue and a shared limit on in-flight evaluations per serving replica. For example, 100 inputs produce 1,000 evaluations that can be drained over time. Submit independent requests concurrently so vLLM can batch work across inputs. Tune the limit against completed inputs per second and the time until the tenth label arrives. Bound the queue or apply backpressure when demand exceeds that measured rate.
 
-Enable APC on the existing serve command. Set the context budget for one rendered policy, one input, and its output. For example, 32,768 tokens allows 12,768 additional tokens after an exactly 20,000-token prefix.
+### Minimal server command
+
+For the public 12B instruction-tuned checkpoint used in the estimate below, start one replica with automatic KV pool sizing:
 
 ```bash
-vllm serve "$MODEL" --enable-prefix-caching --max-model-len 32768
+vllm serve google/gemma-4-12B-it \
+  --enable-prefix-caching \
+  --max-model-len 32768
 ```
+
+Substitute the exact checkpoint you already serve and keep any GPU-specific launch arguments from that deployment. The context limit applies to one evaluation. After an exactly 20,000-token policy prefix, 12,768 tokens remain for the input, remaining template tokens, and generated label.
+
+| Optional argument | When to use it |
+| --- | --- |
+| `--kv-cache-memory-bytes 12884901888` | Example fixed **12 GiB per GPU** for the entire KV pool. Use a measured value that fits alongside weights and runtime allocations. An explicit byte budget overrides automatic sizing via `--gpu-memory-utilization`. The pool serves both policy prefixes and live requests. |
+| `--max-num-seqs 16` | Example scheduler cap of 16 sequences per iteration per replica with one data-parallel rank. Tune against peak memory pressure and time to the tenth label. Keep a separate application limit on queued and in-flight evaluations. |
+
+### Keeping the policies warm
 
 Warm each policy once on the replica that will serve it. Send the full policy and current input on every subsequent request. Resident KV blocks can skip most policy prefill. The input text follows a different prefix in each evaluation, so it incurs prefill ten times. Each generation also attends to its policy context. For a 500-token input, budget roughly 5,000 newly prefilled input tokens per completed input on a warm server, plus template overhead, unmatched block tails, and the ten outputs. [Cache matching and eviction](prefix_caching.md)
 
+Stock vLLM provides best-effort residency. It can reclaim unused policy blocks under memory pressure. The server has no documented flag to reserve the first 20,000 tokens of each policy against eviction. On Gemma, `--prefix-cache-retention-interval` controls sliding-window checkpoint spacing. Changing that interval does not create a protected token budget. [Cache configuration](../../vllm/config/cache.py)
+
 Start with all ten policies on one replica if they stay warm at target concurrency. With several replicas, assign policy sets to replicas and dispatch each evaluation to one that holds its policy. Replicate a set if its queue becomes the bottleneck. If ten prefixes cycle out on a single GPU and requests can tolerate queueing, benchmark short same-policy batches across inputs. Bound the wait for each policy so one missing label does not hold completed inputs indefinitely.
+
+If a cold policy would violate a hard latency requirement, explicit GPU pinning would be a separate engine change in this fork. Protect the blocks needed to resume each policy across both global and sliding-window cache groups, account for shared blocks once, and leave capacity for live requests. Mark a replica ready only after all ten prefixes have been warmed and protected. Repeat after a restart and release old pins when a policy revision drains.
 
 ## 3. Estimate the KV working set
 
@@ -50,6 +67,8 @@ The raw estimate is **632.5 MiB per policy, or 6.18 GiB for ten** before common-
 | Policy coverage and correctness | Run labeled fixtures including an input with different expected outcomes under two policies. Compare each rendered request and prediction with a standalone run of the same policy. Test an unknown label, a duplicate delivery, and a single failed evaluation followed by a retry. | Exactly ten distinct valid policy results per completed input. A missing label keeps the input incomplete. Assess agreement and moderation quality separately for each policy. |
 | Warm prefix reuse | On an idle replica, send one input through all ten policies to warm them. Send a second, different input through all ten. Run the second pass serially to attribute each prefix-hit counter delta to one policy. | Compare hits per policy to the tokenized common prefix of the two rendered requests. Expect about 200K cached tokens in total for ten 20K resident prefixes, subject to block boundaries. |
 | Production load | Use representative arrival rates, input lengths, and label lengths. Increase the in-flight limit in steps. Measure from input admission to persistence of the tenth valid label, including time in the queue and retries. | Sustainable **fully labeled inputs/second**, p50/p95 completion latency, queue depth, retry rate, preemptions, and cache hits. At 10 inputs/second, the service must sustain at least 100 successful policy evaluations/second. |
+
+After a representative traffic burst, send one fresh input through each policy again on the isolated replica and inspect hits per policy. If the sequential test passes before the burst but falls short afterward, reduce in-flight work or increase the KV budget within measured GPU headroom, then repeat. A high aggregate hit rate can hide eviction of an individual policy.
 
 Read the token-valued `vllm:prefix_cache_hits` counter for the target engine from `/metrics` (the exposed series may have a `_total` suffix). Compare warm and cold time to first token to diagnose prefill savings. Use end-to-end completion latency to decide whether the moderation service meets its target. [Production metrics](../usage/metrics.md)
 
